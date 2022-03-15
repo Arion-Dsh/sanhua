@@ -26,9 +26,9 @@ func NewPacket() *Packet {
 	return &Packet{body: new(bytes.Buffer)}
 }
 
-// Size return packet's bit size.
+// Size returns number of packet's bytes.
 func (pkt *Packet) Size() int {
-	return 96 + pkt.body.Len()*4
+	return 12 + pkt.body.Len()
 }
 
 //Sequence is remote send sequence.
