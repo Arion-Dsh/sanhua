@@ -27,7 +27,7 @@ func Listen(network, address string) (*Conn, error) {
 		return nil, err
 	}
 
-	addr, err := net.ResolveUDPAddr("udp", address)
+	addr, err := net.ResolveUDPAddr(network, address)
 
 	if err != nil {
 		return nil, err

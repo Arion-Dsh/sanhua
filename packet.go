@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"io"
 	"sync"
 	"time"
 )
@@ -64,8 +63,8 @@ func (pkt *Packet) Read(p []byte) (int, error) {
 }
 
 // Body represents packet body.
-func (pkt *Packet) Body() io.ReadWriter {
-	return pkt.body
+func (pkt *Packet) Body() []byte {
+	return pkt.body.Bytes()
 }
 
 // Reset resets the Pact to be empty,
@@ -99,8 +98,10 @@ func (pkt *Packet) unMarshal(buf []byte) error {
 	binary.Read(data, binary.BigEndian, &p.sequence)
 	binary.Read(data, binary.BigEndian, &p.ack)
 	binary.Read(data, binary.BigEndian, &p.ackField)
-	p.body = data
-	pkt = &p
+	pkt.sequence = p.sequence
+	pkt.ack = p.ack
+	pkt.ackField = p.ackField
+	data.WriteTo(pkt.body)
 	return nil
 }
 

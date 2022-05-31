@@ -13,6 +13,8 @@ func main() {
 		if err != nil {
 			fmt.Print(err)
 		}
+
+		fmt.Println(pkt.Body())
 		conn.WriteTo(pkt, addr)
 	}
 }
