@@ -297,7 +297,7 @@ func (c *Conn) rcvWatch() {
 func (c *Conn) reverseSeg(rcv *rcv) {
 	seg := new(segment)
 	seg.unMarshal(rcv.b)
-	seg.prot += 2
+	seg.prot += 1
 	seg.ack = seg.seq
 	seg.rAddr = rcv.addr
 	c.rcvSeg[seg.seq] = seg
