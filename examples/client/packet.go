@@ -30,15 +30,12 @@ func main() {
 	pkt := sanhua.NewPacket()
 
 	pkt.Write([]byte{1})
-
-	c.Write(pkt)
-	pkt.Write([]byte{2, 24})
-	c.Write(pkt)
-	pkt.Write([]byte{14, 14})
-	c.Write(pkt)
+	c.PacketWriteTo(pkt, raddr)
+	pkt.Write([]byte{2})
+	c.PacketWriteTo(pkt, raddr)
 
 	for {
-		pkt, _ := c.Read()
-		fmt.Println(pkt.Ack(), "ack")
+		pkt, _, _ := c.PacketReadFrom()
+		fmt.Println(pkt.AckField(), "pkt")
 	}
 }

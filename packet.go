@@ -4,25 +4,38 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"net"
 	"sync"
 	"time"
 )
 
 var (
 	ErrPacketBodyNil error = errors.New("Packet body nil")
+	packetPool       sync.Pool
 )
+
+func init() {
+	packetPool = sync.Pool{
+		New: func() interface{} {
+			return NewPacket()
+		},
+	}
+}
 
 // Packet implements generic packet-oriented .
 type Packet struct {
+	prot     byte
 	sequence uint32
 	ack      uint32
 	ackField uint32
-	body     *bytes.Buffer
+	body     bytes.Buffer
+
+	addr *net.UDPAddr
 }
 
 //NewPacket create a Packet. Always use this method. do not use new(Packet)
 func NewPacket() *Packet {
-	return &Packet{body: new(bytes.Buffer)}
+	return &Packet{}
 }
 
 // Size returns number of packet's bytes.
@@ -68,7 +81,7 @@ func (pkt *Packet) Body() []byte {
 }
 
 // Reset resets the Pact to be empty,
-//but it retains the underlying storage for use by future writes.
+//but it retains the underlying storage for use by future writers.
 func (pkt *Packet) Reset() {
 	pkt.sequence = 0
 	pkt.ack = 0
@@ -77,10 +90,8 @@ func (pkt *Packet) Reset() {
 }
 
 func (pkt *Packet) marshal() ([]byte, error) {
-	if pkt.body == nil {
-		return nil, ErrPacketBodyNil
-	}
 	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, pkt.prot)
 	binary.Write(buf, binary.BigEndian, pkt.sequence)
 	binary.Write(buf, binary.BigEndian, pkt.ack)
 	binary.Write(buf, binary.BigEndian, pkt.ackField)
@@ -93,15 +104,12 @@ func (pkt *Packet) marshal() ([]byte, error) {
 }
 
 func (pkt *Packet) unMarshal(buf []byte) error {
-	var p Packet
 	data := bytes.NewBuffer(buf)
-	binary.Read(data, binary.BigEndian, &p.sequence)
-	binary.Read(data, binary.BigEndian, &p.ack)
-	binary.Read(data, binary.BigEndian, &p.ackField)
-	pkt.sequence = p.sequence
-	pkt.ack = p.ack
-	pkt.ackField = p.ackField
-	data.WriteTo(pkt.body)
+	binary.Read(data, binary.BigEndian, &pkt.prot)
+	binary.Read(data, binary.BigEndian, &pkt.sequence)
+	binary.Read(data, binary.BigEndian, &pkt.ack)
+	binary.Read(data, binary.BigEndian, &pkt.ackField)
+	data.WriteTo(&pkt.body)
 	return nil
 }
 

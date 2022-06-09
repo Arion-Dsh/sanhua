@@ -8,12 +8,14 @@ package sanhua
 import (
 	"errors"
 	"net"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	max_readbytes = 2 << 10 //2046b
+	max_readbytes = 2 << 9 //1024 byte
 	max_sequence  = (1 << 32) - 1
 )
 
@@ -51,7 +53,7 @@ func ListenUDP(network string, addr *net.UDPAddr) (*Conn, error) {
 		return nil, err
 	}
 
-	l := NewConn(c)
+	l := NewConn(c, addr, nil)
 
 	return l, nil
 }
@@ -83,85 +85,254 @@ func Dial(network, address string) (*Conn, error) {
 // DialUDP connects with existed UDP address.
 // laddr and raddr not be nil.
 // see Dial.
-func DialUDP(network string, laddr, raddr *net.UDPAddr) (*Conn, error) {
+func DialUDP(network string, lAddr, rAddr *net.UDPAddr) (*Conn, error) {
 
 	err := checkNewwork(network)
 	if err != nil {
 		return nil, err
 	}
 
-	c, err := net.DialUDP(network, laddr, raddr)
+	c, err := net.ListenUDP(network, lAddr)
 
 	if err != nil {
 		return nil, err
 	}
-	l := NewConn(c)
+	l := NewConn(c, lAddr, rAddr)
 
 	return l, nil
 }
 
-// Conn send and receive data packets upon a network stream connection.
+/* // Conn send and receive data packets upon a network stream connection. */
 type Conn struct {
-	udp *net.UDPConn
+	seq uint32
 
+	udp   *net.UDPConn
+	lAddr *net.UDPAddr
+	rAddr *net.UDPAddr
+
+	writeQ map[uint32]*segment
+
+	rcvSeg   map[uint32]*segment
+	rcvSegs  map[uint32]*segments
+	rcvEvent chan struct{}
+
+	readQ chan *segments
+
+	rcv chan *rcv
+
+	rcvPacket chan *Packet
 	ackChache *ackChache
 
-	lSequence uint32
-	mux       sync.Mutex
+	rtt time.Duration
 
-	pool sync.Pool
-
-	r int // max read bytes
+	r    int
+	prot uint8
 }
 
-//NewConn new connection with existed upd connection.
-func NewConn(udp *net.UDPConn) *Conn {
-	l := &Conn{udp: udp, r: max_readbytes}
-	l.ackChache = newAckCache()
-	l.pool = sync.Pool{
-		New: func() interface{} {
-			return NewPacket()
-		},
-	}
-	return l
+func NewConn(udp *net.UDPConn, l, r *net.UDPAddr) *Conn {
+	c := &Conn{
+		udp:   udp,
+		lAddr: l,
+		rAddr: r,
 
-}
+		writeQ:   map[uint32]*segment{},
+		rcvSeg:   map[uint32]*segment{},
+		rcvSegs:  map[uint32]*segments{},
+		rcvEvent: make(chan struct{}),
+		readQ:    make(chan *segments),
 
-func (c *Conn) LocalAddr() net.Addr {
-	return c.udp.LocalAddr()
-}
+		rcv:       make(chan *rcv),
+		rcvPacket: make(chan *Packet),
 
-func (c *Conn) RemoteAddr() net.Addr {
-	return c.udp.RemoteAddr()
-}
-
-func (c *Conn) ReadFrom() (*Packet, *net.UDPAddr, error) {
-
-	buf := make([]byte, c.r)
-	n, addr, err := c.udp.ReadFromUDP(buf)
-	if err != nil {
-		return nil, nil, err
+		r:    max_readbytes,
+		prot: 42,
 	}
 
-	pkt := c.pool.Get().(*Packet)
-	defer c.pool.Put(pkt)
-	pkt.Reset()
-
-	err = pkt.unMarshal(buf[:n])
-	if err != nil {
-		return nil, nil, err
-	}
-
-	c.sCheck(pkt.ack)
-
-	return pkt, addr, nil
+	c.ackChache = newAckCache()
+	c.rcvWatch()
+	return c
 }
 
-func (c *Conn) WriteTo(pkt *Packet, addr *net.UDPAddr) error {
+func (c *Conn) ReadFromUDP(p []byte) (int, *net.UDPAddr, error) {
+
+	s := <-c.readQ
+	n, err := s.body.Read(p)
+	return n, s.rAddr, err
+}
+
+func (c *Conn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
+
+	if addr == nil {
+		return 0, nil
+	}
+
+	id := atomic.AddUint32(&segmentID, 1)
+	s := [][]byte{}
+	for {
+		w := make([]byte, c.r)
+		n := copy(w, b)
+
+		s = append(s, w[:n])
+
+		if n < c.r {
+			break
+		}
+		b = b[n:]
+	}
+
+	var wg sync.WaitGroup
+	for _, buf := range s {
+		wg.Add(1)
+
+		go func(id uint32, buf []byte) {
+			defer wg.Done()
+			seg := segmentPool.Get().(*segment)
+			defer segmentPool.Put(seg)
+
+			seg.reset(c, addr)
+			seg.id = id
+			seg.seq = atomic.AddUint32(&segmentSeq, 1)
+			seg.length = uint32(len(s))
+			seg.body = buf
+
+			p := seg.marshal()
+			c.udp.WriteTo(p, addr)
+			seg.t = time.Now()
+
+			c.writeQ[seg.seq] = seg
+
+			<-seg.done
+		}(id, buf)
+
+	}
+	wg.Wait()
+
+	return len(b), nil
+}
+
+func (c *Conn) rcvWatch() {
+
+	go func() {
+		for {
+			rcv := <-c.rcv
+			switch rcv.b[0] {
+			case c.prot:
+				pkt := new(Packet)
+				err := pkt.unMarshal(rcv.b)
+				if err != nil {
+					continue
+				}
+				pkt.addr = rcv.addr
+				c.rcvPacket <- pkt
+
+			case c.prot + 1:
+				c.reverseSeg(rcv)
+			case c.prot + 2:
+				c.checkSegRcv(rcv)
+			}
+
+		}
+	}()
+
+	go func() {
+
+		for {
+			<-c.rcvEvent
+			for k, v := range c.rcvSeg {
+				s, ok := c.rcvSegs[v.id]
+				if !ok {
+					s = &segments{
+						id:     v.id,
+						length: v.length,
+						segIDs: map[uint32]struct{}{},
+						segs:   []*segment{},
+						rAddr:  v.rAddr,
+					}
+
+				}
+				c.rcvSegs[v.id] = s
+				s.mu.Lock()
+				if _, ok := s.segIDs[k]; !ok {
+					s.segIDs[k] = struct{}{}
+					s.segs = append(s.segs, v)
+				}
+				s.mu.Unlock()
+				delete(c.rcvSeg, k)
+				if int(s.length) == len(s.segs) {
+					sort.Slice(s.segs, func(i, j int) bool {
+						return s.segs[i].seq < s.segs[j].seq
+					})
+
+					for i := range s.segs {
+						s.body.Write(s.segs[i].body)
+					}
+					s.done = true
+					c.readQ <- s
+
+				}
+			}
+		}
+
+	}()
+
+	go func() {
+		for {
+			buf := make([]byte, c.r)
+			n, addr, err := c.udp.ReadFromUDP(buf)
+			if err != nil {
+				continue
+			}
+			switch buf[0] {
+			case c.prot, c.prot + 1, c.prot + 2:
+			default:
+				continue
+			}
+			b := make([]byte, n)
+			copy(b, buf)
+			c.rcv <- &rcv{t: time.Now(), addr: addr, b: b[:n]}
+		}
+	}()
+}
+
+func (c *Conn) reverseSeg(rcv *rcv) {
+	seg := new(segment)
+	seg.unMarshal(rcv.b)
+	seg.prot += 2
+	seg.ack = seg.seq
+	seg.rAddr = rcv.addr
+	c.rcvSeg[seg.seq] = seg
+	p := seg.encodeHeader()
+	c.udp.WriteTo(p, rcv.addr)
+	c.rcvEvent <- struct{}{}
+}
+
+func (c *Conn) checkSegRcv(rcv *rcv) {
+
+	seg := segmentPool.Get().(*segment)
+	defer segmentPool.Put(seg)
+	seg.reset(c, nil)
+	seg.unMarshal(rcv.b)
+
+	rcvSeg, ok := c.writeQ[seg.ack]
+
+	if ok {
+		delete(c.writeQ, seg.ack)
+		rcvSeg.done <- struct{}{}
+	}
+
+}
+
+func (c *Conn) PacketReadFrom() (*Packet, *net.UDPAddr, error) {
+	pkt := <-c.rcvPacket
+	return pkt, pkt.addr, nil
+}
+
+func (c *Conn) PacketWriteTo(pkt *Packet, addr *net.UDPAddr) error {
+
+	pkt.prot = c.prot
 
 	pkt.ack = pkt.sequence
-
-	pkt.sequence = c.sUp()
+	pkt.sequence = atomic.AddUint32(&c.seq, 1)
 
 	c.ackChache.cache(addr.String(), pkt)
 	data, _ := pkt.marshal()
@@ -173,42 +344,18 @@ func (c *Conn) WriteTo(pkt *Packet, addr *net.UDPAddr) error {
 	return nil
 }
 
-func (c *Conn) Read() (*Packet, error) {
-	buf := make([]byte, c.r)
-	n, err := c.udp.Read(buf)
-	if err != nil {
-		return nil, err
-	}
-
-	pkt := c.pool.Get().(*Packet)
-	defer c.pool.Put(pkt)
-	pkt.Reset()
-
-	err = pkt.unMarshal(buf[:n])
-	if err != nil {
-		return nil, err
-	}
-	c.sCheck(pkt.ack)
-	return pkt, nil
+func (c *Conn) LocalAddr() net.Addr {
+	return c.udp.LocalAddr()
 }
 
-func (c *Conn) Write(pkt *Packet) error {
-
-	pkt.sequence = c.sUp()
-
-	data, _ := pkt.marshal()
-
-	_, err := c.udp.Write(data)
-	if err != nil {
-		return err
-	}
-	return nil
+func (c *Conn) RemoteAddr() net.Addr {
+	return c.udp.RemoteAddr()
 }
 
 // Sequence is local sequence for udp send
 // each time send a packet increase the local sequence number
 func (c *Conn) Sequence() uint32 {
-	return c.lSequence
+	return c.seq
 }
 
 // SetDeadline sets the read and write deadlines associated with the endpoint.
@@ -236,34 +383,12 @@ func (c *Conn) SetReadBuffer(bytes int) error {
 	return c.udp.SetReadBuffer(bytes)
 }
 
-func (c *Conn) sCheck(s uint32) {
-	c.mux.Lock()
-	defer c.mux.Unlock()
-	if sequenceGreaterThan(s, c.lSequence) {
-		c.lSequence = s
-	}
-}
-
-func (c *Conn) sUp() uint32 {
-	c.mux.Lock()
-	defer c.mux.Unlock()
-	c.lSequence++
-	return c.lSequence
-}
-
-func (c *Conn) sDown() uint32 {
-	c.mux.Lock()
-	defer c.mux.Unlock()
-	c.lSequence--
-	return c.lSequence
-}
-
 func checkNewwork(n string) error {
 	switch n {
 	case "udp", "udp4", "udp6":
 		return nil
 	}
-	return errors.New("sanhua: error nework mustbe \"udp\" \"udp4\" or \"udp6\" .")
+	return errors.New("sanhua: error nework must be \"udp\" \"udp4\" or \"udp6\" .")
 }
 
 func sequenceGreaterThan(s1, s2 uint32) bool {
