@@ -123,7 +123,8 @@ type Conn struct {
 	rcvPacket chan *Packet
 	ackChache *ackChache
 
-	rtt time.Duration
+	rtt  time.Duration
+	rttC uint8
 
 	r    int
 	prot uint8
@@ -194,7 +195,6 @@ func (c *Conn) WriteToUDP(b []byte, addr *net.UDPAddr) (int, error) {
 			seg.seq = atomic.AddUint32(&segmentSeq, 1)
 			seg.length = uint32(len(s))
 			seg.body = buf
-
 			p := seg.marshal()
 			c.udp.WriteTo(p, addr)
 			seg.t = time.Now()
@@ -300,6 +300,8 @@ func (c *Conn) reverseSeg(rcv *rcv) {
 	seg.prot += 1
 	seg.ack = seg.seq
 	seg.rAddr = rcv.addr
+	seg.t = rcv.t
+
 	c.rcvSeg[seg.seq] = seg
 	p := seg.encodeHeader()
 	c.udp.WriteTo(p, rcv.addr)
@@ -318,8 +320,26 @@ func (c *Conn) checkSegRcv(rcv *rcv) {
 	if ok {
 		delete(c.writeQ, seg.ack)
 		rcvSeg.done <- struct{}{}
+		n := time.Now()
+		c.changeRTT(n.Sub(rcvSeg.t))
 	}
 
+}
+
+func (c *Conn) changeRTT(d time.Duration) {
+
+	if c.rtt < d {
+		c.rtt = d
+		c.rttC = 0
+	}
+	if c.rtt > d {
+		if c.rttC > 10 {
+			c.rtt = d
+			c.rttC = 0
+		} else {
+			c.rttC += 1
+		}
+	}
 }
 
 func (c *Conn) PacketReadFrom() (*Packet, *net.UDPAddr, error) {
@@ -377,9 +397,13 @@ func (c *Conn) Close() error {
 	return c.udp.Close()
 }
 
+func (c *Conn) RTT() time.Duration {
+	return c.rtt
+}
+
 // SetReadBuffer implements *net.UDPConn SetReadBuffer method.
 func (c *Conn) SetReadBuffer(bytes int) error {
-	c.r = bytes * 2
+	c.r = bytes
 	return c.udp.SetReadBuffer(bytes)
 }
 

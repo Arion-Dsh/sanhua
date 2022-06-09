@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/arion-dsh/sanhua"
 )
@@ -31,9 +30,9 @@ func main() {
 
 	var buf bytes.Buffer
 	buf.WriteString("123")
-	t := time.Now()
-	c.WriteToUDP(buf.Bytes(), raddr)
-	n := time.Now()
-	fmt.Println(n.Sub(t))
+	for i := 0; i < 20; i++ {
+		c.WriteToUDP(buf.Bytes(), raddr)
+		fmt.Println(c.RTT())
+	}
 
 }
