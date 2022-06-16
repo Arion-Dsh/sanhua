@@ -17,30 +17,37 @@ var (
 func init() {
 	packetPool = sync.Pool{
 		New: func() interface{} {
-			return NewPacket()
+			return &Packet{
+				done: make(chan struct{}),
+			}
 		},
 	}
 }
 
 // Packet implements generic packet-oriented .
 type Packet struct {
-	prot     byte
+	proto    byte
 	sequence uint32
 	ack      uint32
 	ackField uint32
 	body     bytes.Buffer
 
 	addr *net.UDPAddr
+
+	t    time.Time
+	done chan struct{}
 }
 
 //NewPacket create a Packet. Always use this method. do not use new(Packet)
 func NewPacket() *Packet {
-	return &Packet{}
+	return &Packet{
+		done: make(chan struct{}),
+	}
 }
 
-// Size returns number of packet's bytes.
-func (pkt *Packet) Size() int {
-	return 12 + pkt.body.Len()
+// Len returns number of packet's bytes.
+func (pkt *Packet) Len() int {
+	return pkt.body.Len()
 }
 
 //Sequence is remote send sequence.
@@ -80,6 +87,14 @@ func (pkt *Packet) Body() []byte {
 	return pkt.body.Bytes()
 }
 
+func (pkt *Packet) Wait() {
+	<-pkt.done
+}
+
+func (pkt *Packet) Done() {
+	pkt.done <- struct{}{}
+}
+
 // Reset resets the Pact to be empty,
 //but it retains the underlying storage for use by future writers.
 func (pkt *Packet) Reset() {
@@ -89,9 +104,19 @@ func (pkt *Packet) Reset() {
 	pkt.body.Reset()
 }
 
+func (pkt *Packet) marshalHeader() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, pkt.proto)
+	binary.Write(buf, binary.BigEndian, pkt.sequence)
+	binary.Write(buf, binary.BigEndian, pkt.ack)
+	binary.Write(buf, binary.BigEndian, pkt.ackField)
+	b := buf.Bytes()
+	return b, nil
+}
+
 func (pkt *Packet) marshal() ([]byte, error) {
 	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, pkt.prot)
+	binary.Write(buf, binary.BigEndian, pkt.proto)
 	binary.Write(buf, binary.BigEndian, pkt.sequence)
 	binary.Write(buf, binary.BigEndian, pkt.ack)
 	binary.Write(buf, binary.BigEndian, pkt.ackField)
@@ -105,7 +130,7 @@ func (pkt *Packet) marshal() ([]byte, error) {
 
 func (pkt *Packet) unMarshal(buf []byte) error {
 	data := bytes.NewBuffer(buf)
-	binary.Read(data, binary.BigEndian, &pkt.prot)
+	binary.Read(data, binary.BigEndian, &pkt.proto)
 	binary.Read(data, binary.BigEndian, &pkt.sequence)
 	binary.Read(data, binary.BigEndian, &pkt.ack)
 	binary.Read(data, binary.BigEndian, &pkt.ackField)
@@ -143,31 +168,34 @@ func newAckCache() *ackChache {
 	return c
 }
 
-func (af *ackChache) cache(k string, pkt *Packet) {
+func (af *ackChache) cache(k string, ack uint32) (uint32, bool) {
 	af.mux.Lock()
 	defer af.mux.Unlock()
 	f, ok := af.fields[k]
 	if !ok {
-		f = &ackField{update: time.Now()}
+		f = &ackField{update: time.Now(), acks: make([]uint32, 0, 2000)}
 		af.fields[k] = f
 	}
+	has := af.checkAck(f.acks, ack)
 
 	//check down to 32nd ack
+	var fields uint32
 	for i := uint32(1); i < 33; i++ {
-		a, ok := af.checkAck(f.acks, pkt.ack-i)
+		ok := af.checkAck(f.acks, ack-i)
 		if ok {
-			pkt.ackField |= 1 << (pkt.ack - a - 1)
+			// fields |= 1 << (ack - a - 1)
+			fields |= 1 << (i - 1)
 		}
 	}
 
-	//max cache 100 acks
-	size := len(f.acks) + 1
-	if size > 100 {
-		size = 100
+	//max cache 2000 acks
+	if len(f.acks) == cap(f.acks) {
+		s := make([]uint32, 0, 2000)
+		s = append(s, f.acks[2000-33:]...)
+		f.acks = s
 	}
-	n := make([]uint32, size)
-	n[0] = pkt.ack
-	copy(n[1:], f.acks)
+
+	f.acks = append(f.acks, ack)
 
 	// seemed sort is not necessary.
 	// [3, 2, 1]
@@ -178,17 +206,17 @@ func (af *ackChache) cache(k string, pkt *Packet) {
 			},
 		)
 	*/
-	f.acks = n
+	return fields, has
 }
 
-func (af *ackChache) checkAck(fs []uint32, a uint32) (uint32, bool) {
+func (af *ackChache) checkAck(fs []uint32, a uint32) bool {
 	for _, v := range fs {
 		if a == v {
-			return v, true
+			return true
 		}
 	}
 
-	return 0, false
+	return false
 }
 
 func (af *ackChache) flush(now time.Time) {
