@@ -6,7 +6,6 @@ lost packet.
 package sanhua
 
 import (
-	"encoding/binary"
 	"errors"
 	"math"
 	"net"
@@ -113,11 +112,10 @@ type Conn struct {
 	udp   *net.UDPConn
 	lAddr *net.UDPAddr
 	rAddr *net.UDPAddr
-	// udpMux sync.Mutex
 
-	writeQ map[uint32]*Packet
+	writeQ sync.Map
 	qMux   sync.RWMutex
-	rcvs   map[uint32]*rcv
+	rcvs   sync.Map
 	rcvMux sync.RWMutex
 	readQ  chan *rcv
 
@@ -143,9 +141,7 @@ func NewConn(udp *net.UDPConn, l, r *net.UDPAddr) *Conn {
 		lAddr: l,
 		rAddr: r,
 
-		writeQ: map[uint32]*Packet{},
-		rcvs:   map[uint32]*rcv{},
-		readQ:  make(chan *rcv),
+		readQ: make(chan *rcv),
 
 		rcv:       make(chan *rcv),
 		rcvPacket: make(chan *Packet),
@@ -222,8 +218,8 @@ func (c *Conn) WriteToUDP(p []byte, addr *net.UDPAddr) (int, error) {
 			pk.proto = c.proto + 1
 			pk.sequence = seq
 
-			binary.Write(&pk.body, binary.BigEndian, gid)
-			binary.Write(&pk.body, binary.BigEndian, uint32(size))
+			pk.body.Write(u32Bytes(gid))
+			pk.body.Write(u32Bytes(uint32(size)))
 			pk.body.Write(buf)
 
 			p, _ := pk.marshal()
@@ -233,10 +229,7 @@ func (c *Conn) WriteToUDP(p []byte, addr *net.UDPAddr) (int, error) {
 				errs <- err
 				return
 			}
-
-			c.qMux.RLock()
-			c.writeQ[pk.sequence] = pk
-			c.qMux.RUnlock()
+			c.writeQ.Store(pk.sequence, pk)
 
 			ticker := time.NewTicker(c.rtt)
 			for {
@@ -328,35 +321,27 @@ func (c *Conn) composeRcv(r *rcv) {
 	if ok {
 		return
 	}
-	var gid, size uint32
 
-	binary.Read(&pkt.body, binary.BigEndian, &gid)
-	binary.Read(&pkt.body, binary.BigEndian, &size)
-
-	c.rcvMux.RLock()
-	rs, ok := c.rcvs[gid]
-	c.rcvMux.RUnlock()
-
-	if !ok {
-		rs = &rcv{
-			id:     gid,
-			size:   int(size),
-			addr:   r.addr,
-			pktIDs: map[uint32]struct{}{},
-		}
-
-		c.rcvMux.Lock()
-		c.rcvs[rs.id] = rs
-		c.rcvMux.Unlock()
+	p := make([]byte, 4)
+	pkt.body.Read(p)
+	gid := bytesU32(p)
+	pkt.body.Read(p)
+	size := bytesU32(p)
+	rs := &rcv{
+		id:     gid,
+		size:   int(size),
+		addr:   r.addr,
+		pktIDs: map[uint32]struct{}{},
 	}
 
+	rsi, _ := c.rcvs.LoadOrStore(rs.id, rs)
+	rs, _ = rsi.(*rcv)
+
+	rs.mux.Lock()
 	if _, ok := rs.pktIDs[pkt.ack]; !ok {
-		rs.mux.Lock()
 		rs.pktIDs[pkt.ack] = struct{}{}
 		rs.pkts = append(rs.pkts, pkt)
-		rs.mux.Unlock()
 	}
-
 	if rs.size == len(rs.pkts) {
 		sort.Slice(rs.pkts, func(i, j int) bool {
 			return rs.pkts[j].ack > rs.pkts[i].ack
@@ -366,12 +351,11 @@ func (c *Conn) composeRcv(r *rcv) {
 			rs.pkts[i].body.WriteTo(&rs.body)
 		}
 
-		c.rcvMux.Lock()
-		delete(c.rcvs, rs.id)
-		c.rcvMux.Unlock()
+		c.rcvs.Delete(rs.id)
 
 		c.readQ <- rs
 	}
+	rs.mux.Unlock()
 
 }
 
@@ -392,13 +376,13 @@ func (c *Conn) checkRcv(rcv *rcv) {
 
 }
 func (c *Conn) removePkt(ack uint32) {
-	c.qMux.Lock()
-	defer c.qMux.Unlock()
-	if p, ok := c.writeQ[ack]; ok {
-		delete(c.writeQ, ack)
+	pi, ok := c.writeQ.LoadAndDelete(ack)
+	if ok {
+		p := pi.(*Packet)
 		p.done <- struct{}{}
 		now := time.Now()
 		go c.changeRTT(p.t, now)
+
 	}
 }
 

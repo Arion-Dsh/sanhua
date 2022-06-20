@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/arion-dsh/sanhua"
 )
@@ -54,12 +53,11 @@ But how can we possibly fit 33 acks in a packet? At 4 bytes per-ack thats 132 by
 The trick is to represent the 32 previous acks before “ack” using a bitfield:
 	`
 	buf.WriteString(s)
-	for i := 0; i < 120; i++ {
-		n := time.Now()
-		c.WriteToUDP([]byte{13}, raddr)
-		nn := time.Now()
-		fmt.Println(nn.Sub(n), c.RTT())
-		time.Sleep(2 * time.Millisecond)
+	fmt.Println(buf.Len())
+	for i := 0; i < 200; i++ {
+		c.WriteToUDP(buf.Bytes(), raddr)
+		fmt.Println(c.RTT())
+		// time.Sleep(200 * time.Millisecond)
 	}
 
 }

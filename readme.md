@@ -15,34 +15,47 @@ is receied on other side.
 
 ### reliability
 
-for more reliable, we useing redundancy to defeat ack packet lost or local size sends packet is faster
-than remote side send rate.
-
+1.  Useing PacketWriteTo 
+ for more reliable, we useing redundancy to defeat ack packet lost or local size sends packet is faster
+than remote side send rate. 
 Remote side will send back ack Packet.Ack and down to 33end [ack-33, ack-1] acks on Pack.AckField.
+
+2. Using WriteTo, WriteToUDP
+  it will split p([]byte) to several packets and  block until return acks. if longer than RTT. It will
+  resend the unreceived packet unless timeout(1 second).  use PacketWriteTo if you wan write your resend algorithm.
+
 
 ### example 
 
-there is a simple client side code 
+there is a simple  code 
+
+	// server side 
+	go func() {
+
+		c, _ := Listen("udp", ":8000")
+		p := make([]byte, 1024*2*4)
+		for {
+			c.ReadFromUDP(p)
+		}
+
+	}()
+
+	// client 
+	laddr, _ = net.ResolveUDPAddr("udp", ":8002")
 
 
-	c, err := sanhua.Dial("udp", ":8000")
+	raddr, _ = net.ResolveUDPAddr("udp", ":8000")
 
-	if err != nil {
-	    painc(err)
-	}
 
-	pkt := sanhua.NewPacket()
+	c, _ := DialUDP("udp", laddr, raddr)
 
-	pkt.Write([]byte{2, 24})
-	c.Write(pkt)
-	pkt.Write([]byte{14, 14})
-	c.Write(pkt)
+	c.WriteToUDP([]byte{}, raddr)
 
-	for {
-		pkt, _ := c.Read()
-		fmt.Println(pkt.Ack(), "ack")
-	}
 
+
+
+
+	
 
 
 

@@ -2,7 +2,6 @@ package sanhua
 
 import (
 	"bytes"
-	"encoding/binary"
 	"errors"
 	"net"
 	"sync"
@@ -105,35 +104,30 @@ func (pkt *Packet) Reset() {
 }
 
 func (pkt *Packet) marshalHeader() ([]byte, error) {
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, pkt.proto)
-	binary.Write(buf, binary.BigEndian, pkt.sequence)
-	binary.Write(buf, binary.BigEndian, pkt.ack)
-	binary.Write(buf, binary.BigEndian, pkt.ackField)
-	b := buf.Bytes()
-	return b, nil
+	buf := make([]byte, 0, 13)
+	buf = append(buf, pkt.proto)
+	buf = append(buf, u32Bytes(pkt.sequence)...)
+	buf = append(buf, u32Bytes(pkt.ack)...)
+	buf = append(buf, u32Bytes(pkt.ackField)...)
+	return buf, nil
 }
 
 func (pkt *Packet) marshal() ([]byte, error) {
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, pkt.proto)
-	binary.Write(buf, binary.BigEndian, pkt.sequence)
-	binary.Write(buf, binary.BigEndian, pkt.ack)
-	binary.Write(buf, binary.BigEndian, pkt.ackField)
-
-	_, err := pkt.body.WriteTo(buf)
-	if err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	buf := make([]byte, 0, 13+pkt.body.Len())
+	buf = append(buf, pkt.proto)
+	buf = append(buf, u32Bytes(pkt.sequence)...)
+	buf = append(buf, u32Bytes(pkt.ack)...)
+	buf = append(buf, u32Bytes(pkt.ackField)...)
+	buf = append(buf, pkt.body.Bytes()...)
+	return buf, nil
 }
 
 func (pkt *Packet) unMarshal(buf []byte) error {
-	data := bytes.NewBuffer(buf)
-	binary.Read(data, binary.BigEndian, &pkt.proto)
-	binary.Read(data, binary.BigEndian, &pkt.sequence)
-	binary.Read(data, binary.BigEndian, &pkt.ack)
-	binary.Read(data, binary.BigEndian, &pkt.ackField)
+	pkt.proto = buf[0]
+	pkt.sequence = bytesU32(buf[1:5])
+	pkt.ack = bytesU32(buf[5:9])
+	pkt.ackField = bytesU32(buf[9:13])
+	data := bytes.NewBuffer(buf[13:])
 	data.WriteTo(&pkt.body)
 	return nil
 }
@@ -183,7 +177,7 @@ func (af *ackChache) cache(k string, ack uint32) (uint32, bool) {
 	for i := uint32(1); i < 33; i++ {
 		ok := af.checkAck(f.acks, ack-i)
 		if ok {
-			// fields |= 1 << (ack - a - 1)
+			// fields |= 1 << (ack - (ack - i) - 1)
 			fields |= 1 << (i - 1)
 		}
 	}
@@ -221,12 +215,14 @@ func (af *ackChache) checkAck(fs []uint32, a uint32) bool {
 
 func (af *ackChache) flush(now time.Time) {
 
+	af.mux.Lock()
 	for k, v := range af.fields {
 		if v.update.Add(5 * time.Minute).Before(now) {
 			delete(af.fields, k)
 		}
 
 	}
+	af.mux.Unlock()
 }
 
 func (af *ackChache) close() {
